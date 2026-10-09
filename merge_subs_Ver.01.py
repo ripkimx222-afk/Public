@@ -21,7 +21,6 @@ SOURCES = [
     ("Черные списки VLESS👇", "BLACK_VLESS_RUS.txt"),
     ("Черные списки SS+ALL👇", "BLACK_SS+All_RUS.txt"),
     ("Белые списки CIDR ТОП-150 №1👇", "Vless-Reality-White-Lists-Rus-Mobile.txt"),
-    ("Белые списки CIDR ТОП-150 №2👇", "Vless-Reality-White-Lists-Rus-Mobile-2.txt"),
     ("Белые списки CIDR VK Yandex Beeline👇", "WHITE-CIDR-RU-checked.txt"),
     ("Белые списки CIDR полная👇", "WHITE-CIDR-RU-all.txt"),
     ("Белые списки SNI👇", "WHITE-SNI-RU-all.txt"),
