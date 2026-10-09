@@ -94,11 +94,18 @@ def build(sections):
 def main():
     sections = []
     for title, name in SOURCES:
-        links = parse_links(fetch(BASE + quote(name)))
+        try:
+            links = parse_links(fetch(BASE + quote(name)))
+        except RuntimeError as exc:
+            print("пропуск: %s" % exc)
+            continue
         if not links:
-            raise RuntimeError("пустой список: %s" % name)
+            print("пропуск, список пустой: %s" % name)
+            continue
         print("%s: %d" % (name, len(links)))
         sections.append((title, links))
+    if not sections:
+        raise RuntimeError("ни один список не скачался")
     text, total = build(sections)
     with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(text)
