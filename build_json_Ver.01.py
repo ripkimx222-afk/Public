@@ -31,7 +31,7 @@ MIN_EXTRA_PACK = 5      # вторая и следующие записи тол
 MAX_COUNTRIES = 500     # сколько стран показывать (500 это все)
 LIST_PACK = 20          # серверов в записях Blacklist и Whitelist
 ALL_PART = 15           # серверов из каждого списка в записи "все"
-PROFILE_TITLE = "Маяк Авто"   # название подписки в Happ, до 25 символов; пусто убирает строку
+PROFILE_TITLE = ""   # название подписки в Happ, до 25 символов; пусто убирает строку
 PROBE_URL = "https://www.gstatic.com/generate_204"
 PROBE_INTERVAL = "2m"
 
