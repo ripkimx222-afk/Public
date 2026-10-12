@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-# Собирает JSON-подписку для Happ из списков igareck/vpn-configs-for-russia.
+# Собирает JSON-подписку для Happ из списков igareck/vpn-configs-for-russia
+# и AvenCores/goida-vpn-configs (второй источник, помечается "(Goida vpn)").
 # Каждая запись это отдельный конфиг Xray с балансировщиком leastPing:
 # Happ сам выбирает сервер с наименьшей задержкой внутри записи.
+# Ни один принятый сервер не выбрасывается: если серверов в стране больше,
+# чем помещается в одну запись, они раскладываются по "автовыбор 2", "3" и т.д.
 
 import base64
 import ipaddress
@@ -37,11 +40,26 @@ SOURCES = [
     ("white", "WHITE-SNI-RU-all.txt"),
 ]
 
+# Второй источник — AvenCores/goida-vpn-configs (автогенерируется раз в ~9 минут,
+# github.com/topics/vpn-russia). Берём файлы, которые сам репозиторий называет
+# "рекомендованными" в README (githubmirror/1,6,22,23,24,25.txt). Файл 26.txt —
+# составной (сделан из файлов 1-25 + доп. источники под обход SNI/CIDR whitelist),
+# его можно дописать в список ниже при желании — дубликаты серверов между
+# источниками и так убираются по id+адресу, повторно показаны не будут.
+GOIDA_MIRRORS = [
+    "https://raw.githubusercontent.com/AvenCores/goida-vpn-configs/refs/heads/main/githubmirror/",
+    "https://github.com/AvenCores/goida-vpn-configs/raw/refs/heads/main/githubmirror/",
+]
+GOIDA_FILES = ["1.txt", "6.txt", "22.txt", "23.txt", "24.txt", "25.txt"]
+GOIDA_BRAND = " (Goida vpn)"   # приписка к названию записей этого источника
+
 COUNTRY_PACK = 10          # серверов в одной записи страны
-COUNTRY_MAX_PACKS = 5      # записей на одну страну (автовыбор 1, 2, 3...)
-MIN_EXTRA_PACK = 5         # вторая и следующие записи только если в них не меньше стольких серверов
-NAMELESS_MAX_PACKS = 5     # записей для серверов без страны
-HY2_MAX_PACKS = 1          # записей Hysteria2 на страну
+COUNTRY_MAX_PACKS = 9999   # записей на одну страну: без потолка — лишние серверы не
+                            # выбрасываются, а идут в "автовыбор 2", "3" и т.д.
+MIN_EXTRA_PACK = 1         # короткий хвост (1-4 сервера) всё равно попадает в отдельную
+                            # запись, а не выбрасывается
+NAMELESS_MAX_PACKS = 9999  # то же самое для серверов без страны
+HY2_MAX_PACKS = 9999       # то же самое для Hysteria2
 INCLUDE_HYSTERIA2 = True   # False убирает все записи Hysteria2
 LIST_PACK = 30             # серверов в записях Blacklist и Whitelist
 ALL_PART = 20              # серверов из чёрных и из белых списков в записи "все"
@@ -179,9 +197,9 @@ def parse_links(text):
     return result
 
 
-def fetch_list(name):
+def fetch_list(name, mirrors=MIRRORS):
     errors = []
-    for base in MIRRORS:
+    for base in mirrors:
         try:
             text = fetch(base + quote(name), tries=2)
         except RuntimeError as exc:
@@ -610,7 +628,47 @@ def packs(items, max_packs, label, flag, min_extra=MIN_EXTRA_PACK):
     return result
 
 
-def build(black, white):
+def country_section(std_items, hy2_items, brand_suffix=""):
+    # Строит записи "Страна (автовыбор N)" / "Страна (Hy2 автовыбор N)" / "Без страны ..."
+    # для одного пула серверов (одного источника). brand_suffix дописывается в конец
+    # названия каждой записи этого пула, чтобы отличать источник, например " (Goida vpn)".
+    # Ни один сервер не выбрасывается — см. COUNTRY_MAX_PACKS/MIN_EXTRA_PACK выше.
+    by_country = {}
+    for item in std_items:
+        if item["country"]:
+            by_country.setdefault(item["country"], []).append(item)
+    hy2_by_country = {}
+    hy2_nameless = []
+    for item in hy2_items:
+        if item["country"]:
+            hy2_by_country.setdefault(item["country"], []).append(item)
+        else:
+            hy2_nameless.append(item)
+
+    rows = []
+    for code in set(by_country) | set(hy2_by_country):
+        name = RU_NAMES.get(code, code)
+        flag = flag_of(code)
+        for num, cfg in packs(by_country.get(code, []), COUNTRY_MAX_PACKS,
+                              name + " (автовыбор %d)" + brand_suffix, flag):
+            rows.append((name, 0, num, cfg))
+        for num, cfg in packs(hy2_by_country.get(code, []), HY2_MAX_PACKS,
+                              name + " (Hy2 автовыбор %d)" + brand_suffix, flag, min_extra=1):
+            rows.append((name, 1, num, cfg))
+    rows.sort(key=lambda row: row[:3])
+    result = [row[3] for row in rows]
+
+    nameless = [i for i in std_items if not i["country"]]
+    for num, cfg in packs(nameless, NAMELESS_MAX_PACKS,
+                          "Без страны (автовыбор %d)" + brand_suffix, "🌐"):
+        result.append(cfg)
+    for num, cfg in packs(hy2_nameless, HY2_MAX_PACKS,
+                          "Без страны (Hy2 автовыбор %d)" + brand_suffix, "🌐", min_extra=1):
+        result.append(cfg)
+    return result
+
+
+def build(black, white, goida_std=None, goida_hy2=None):
     std_b = [i for i in black if i["kind"] == "std"]
     std_w = [i for i in white if i["kind"] == "std"]
     std = std_b + std_w
@@ -625,36 +683,13 @@ def build(black, white):
     if std_w:
         configs.append(make_config("⚪ Автовыбор Whitelist", pick(std_w, LIST_PACK)))
 
-    by_country = {}
-    for item in std:
-        if item["country"]:
-            by_country.setdefault(item["country"], []).append(item)
-    hy2_by_country = {}
-    hy2_nameless = []
-    for item in hy2:
-        if item["country"]:
-            hy2_by_country.setdefault(item["country"], []).append(item)
-        else:
-            hy2_nameless.append(item)
+    configs.extend(country_section(std, hy2))
 
-    rows = []
-    for code in set(by_country) | set(hy2_by_country):
-        name = RU_NAMES.get(code, code)
-        flag = flag_of(code)
-        for num, cfg in packs(by_country.get(code, []), COUNTRY_MAX_PACKS,
-                              name + " (автовыбор %d)", flag):
-            rows.append((name, 0, num, cfg))
-        for num, cfg in packs(hy2_by_country.get(code, []), HY2_MAX_PACKS,
-                              name + " (Hy2 автовыбор %d)", flag, min_extra=1):
-            rows.append((name, 1, num, cfg))
-    rows.sort(key=lambda row: row[:3])
-    configs.extend(row[3] for row in rows)
-
-    nameless = [i for i in std if not i["country"]]
-    for num, cfg in packs(nameless, NAMELESS_MAX_PACKS, "Без страны (автовыбор %d)", "🌐"):
-        configs.append(cfg)
-    for num, cfg in packs(hy2_nameless, HY2_MAX_PACKS, "Без страны (Hy2 автовыбор %d)", "🌐", min_extra=1):
-        configs.append(cfg)
+    # Второй источник (Goida vpn) идёт отдельными записями той же страны, а не
+    # смешивается с основным пулом — так сразу видно, откуда взят конкретный сервер,
+    # и если один источник ляжет, записи другого останутся отличимыми и рабочими.
+    if goida_std or goida_hy2:
+        configs.extend(country_section(goida_std or [], goida_hy2 or [], GOIDA_BRAND))
     return configs
 
 
@@ -681,10 +716,11 @@ def report(items):
 
 def main():
     black, white = [], []
+    goida_std, goida_hy2 = [], []
     seen = set()
     for kind, name in SOURCES:
         try:
-            links, base = fetch_list(name)
+            links, base = fetch_list(name, MIRRORS)
         except RuntimeError as exc:
             print("пропуск: %s" % exc)
             continue
@@ -694,16 +730,36 @@ def main():
             if not item or item["key"] in seen:
                 continue
             seen.add(item["key"])
+            item["source"] = "main"
             (black if kind == "black" else white).append(item)
             added += 1
         print("%s: ссылок %d, принято %d (источник %s)" % (name, len(links), added, base.split("/")[2]))
-    if not black and not white:
+
+    for name in GOIDA_FILES:
+        try:
+            links, base = fetch_list(name, GOIDA_MIRRORS)
+        except RuntimeError as exc:
+            print("пропуск (Goida vpn): %s" % exc)
+            continue
+        added = 0
+        for link in links:
+            item = convert(link)
+            if not item or item["key"] in seen:
+                continue  # уже есть из основного источника или из другого файла Goida
+            seen.add(item["key"])
+            item["source"] = "goida"
+            (goida_hy2 if item["kind"] == "hy2" else goida_std).append(item)
+            added += 1
+        print("%s: ссылок %d, принято %d (источник %s, Goida vpn)" % (name, len(links), added, base.split("/")[2]))
+
+    if not black and not white and not goida_std and not goida_hy2:
         raise RuntimeError("ни один список не скачался")
-    configs = build(black, white)
-    report(black + white)
+    configs = build(black, white, goida_std, goida_hy2)
+    report(black + white + goida_std + goida_hy2)
     with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(configs, fh, ensure_ascii=False, separators=(",", ":"))
-    print("записей в подписке: %d" % len(configs))
+    goida_entries = sum(1 for c in configs if c["remarks"].endswith(GOIDA_BRAND))
+    print("записей в подписке: %d (из них Goida vpn: %d)" % (len(configs), goida_entries))
 
 
 if __name__ == "__main__":
