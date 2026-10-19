@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
-# Собирает JSON-подписку для Happ из списков igareck/vpn-configs-for-russia.
+# Собирает JSON-подписку для Happ из открытых списков серверов.
 # Каждая запись это отдельный конфиг Xray с балансировщиком leastPing:
-# Happ сам выбирает сервер с наименьшей задержкой внутри записи.
+# Happ сам выбирает рабочий сервер с наименьшей задержкой внутри записи.
+# Перед сборкой серверы проверяются настоящим Xray: мертвые отбрасываются,
+# а тем, кто не открывает YouTube, в название добавляется YT:❌.
 
 import base64
+import concurrent.futures
+import io
 import ipaddress
 import json
+import os
 import re
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections import Counter
 from urllib.parse import quote, unquote
 
@@ -35,46 +44,64 @@ FLAT447 = [
     "https://raw.githubusercontent.com/FLAT447/v2ray-lists/refs/heads/main/",
     "https://github.com/FLAT447/v2ray-lists/raw/refs/heads/main/",
 ]
-
-# (тип списка, подпись в названии, адреса, файл).
-# Пустая подпись означает основной источник (igareck), он идет без пометки.
-# Чтобы добавить свой список, допишите строку по образцу. Недоступные файлы пропускаются.
-SOURCES = [
-    ("black", "", IGARECK, "BLACK_VLESS_RUS_mobile.txt"),
-    ("black", "", IGARECK, "BLACK_VLESS_RUS.txt"),
-    ("black", "", IGARECK, "BLACK_SS+All_RUS.txt"),
-    ("white", "", IGARECK, "Vless-Reality-White-Lists-Rus-Mobile.txt"),
-    ("white", "", IGARECK, "Vless-Reality-White-Lists-Rus-Mobile-2.txt"),
-    ("white", "", IGARECK, "WHITE-CIDR-RU-checked.txt"),
-    ("white", "", IGARECK, "WHITE-CIDR-RU-all.txt"),
-    ("white", "", IGARECK, "WHITE-SNI-RU-all.txt"),
-    # Goida vpn, рекомендованные автором списки 1, 6, 22, 24, 25 и список 26 для белых списков
-    ("black", "Goida vpn", GOIDA, "1.txt"),
-    ("black", "Goida vpn", GOIDA, "6.txt"),
-    ("black", "Goida vpn", GOIDA, "22.txt"),
-    ("black", "Goida vpn", GOIDA, "24.txt"),
-    ("black", "Goida vpn", GOIDA, "25.txt"),
-    ("white", "Goida vpn", GOIDA, "26.txt"),
-    # FLAT447
-    ("black", "FLAT447", FLAT447, "BLACK_FULL.txt"),
-    ("black", "FLAT447", FLAT447, "BLACK_LTE.txt"),
-    ("white", "FLAT447", FLAT447, "WHITE_FULL.txt"),
-    ("white", "FLAT447", FLAT447, "WHITE_LITE.txt"),
+KORT = [
+    "https://raw.githubusercontent.com/kort0881/vpn-vless-configs-russia/main/githubmirror/",
+    "https://github.com/kort0881/vpn-vless-configs-russia/raw/refs/heads/main/githubmirror/",
 ]
 
-MAX_ENTRIES = 70           # сколько всего записей автовыбора в подписке
-MIN_SERVERS_PER_SOURCE = 100   # минимум серверов из каждого источника (если у него столько есть)
-COUNTRY_PACK = 10          # серверов в одной записи основного источника (igareck)
-EXTRA_PACK = 10            # серверов в одной записи остальных источников
-# Основной источник получает все записи, какие помещаются в лимит, остальные не меньше минимума.
-ALL_MODE = "all"           # "all": одна запись "Автовыбор все"; "sources": по записи на источник; "off": без них
-ALL_PART = 10              # серверов из чёрных и из белых списков каждого источника в записи "все"
-SOURCE_ALL_PART = 30       # серверов в записи "Автовыбор <источник>" (режим "sources")
-BL_WL_GROUPS = True        # записи "Автовыбор Blacklist" и "Автовыбор Whitelist" для каждого источника
-LIST_PACK = 30             # серверов в записях Blacklist и Whitelist
-INCLUDE_HYSTERIA2 = True   # False убирает все записи Hysteria2
-EXTRA_MIN_COUNTRY = 3      # у чужих источников страны с меньшим числом серверов не получают своей записи
+# (тип списка, LTE, адреса, файл).
+# Тип black или white нужен для записей Blacklist и Whitelist.
+# LTE True означает список для мобильного интернета: из таких серверов собираются записи "LTE".
+# Чтобы добавить свой список, допишите строку. Недоступные файлы пропускаются.
+SOURCES = [
+    ("black", False, IGARECK, "BLACK_VLESS_RUS.txt"),
+    ("black", True, IGARECK, "BLACK_VLESS_RUS_mobile.txt"),
+    ("black", False, IGARECK, "BLACK_SS+All_RUS.txt"),
+    ("white", True, IGARECK, "Vless-Reality-White-Lists-Rus-Mobile.txt"),
+    ("white", True, IGARECK, "Vless-Reality-White-Lists-Rus-Mobile-2.txt"),
+    ("white", False, IGARECK, "WHITE-CIDR-RU-checked.txt"),
+    ("white", False, IGARECK, "WHITE-CIDR-RU-all.txt"),
+    ("white", False, IGARECK, "WHITE-SNI-RU-all.txt"),
+    ("black", True, FLAT447, "BLACK_LTE.txt"),
+    ("black", False, FLAT447, "BLACK_FULL.txt"),
+    ("white", True, FLAT447, "WHITE_LITE.txt"),
+    ("white", False, FLAT447, "WHITE_FULL.txt"),
+    ("white", True, KORT, "ru-sni/vless_ru.txt"),
+    ("white", True, KORT, "ru-sni/vmess_ru.txt"),
+    ("black", False, KORT, "clean/vless.txt"),
+    ("black", False, GOIDA, "1.txt"),
+    ("black", False, GOIDA, "6.txt"),
+    ("black", False, GOIDA, "22.txt"),
+    ("black", False, GOIDA, "24.txt"),
+    ("black", False, GOIDA, "25.txt"),
+    ("white", True, GOIDA, "26.txt"),
+]
+
+MAX_ENTRIES = 45           # сколько всего записей автовыбора в подписке
+PACK = 50                  # серверов в одной записи страны
+GROUP_PACK = 50            # серверов в записях "Все", "Blacklist", "Whitelist"
+MIN_COUNTRY_SERVERS = 3    # у страны меньше рабочих серверов своей записи нет (они остаются в общих)
+LTE_TARGET = 200           # сколько рабочих LTE серверов хотим
+LTE_MAX = 250              # не больше стольких LTE серверов в подписке
+INCLUDE_HYSTERIA2 = True   # False убирает серверы Hysteria2 (в названии записей буква H вместо N)
+
+# Проверка серверов настоящим Xray перед сборкой
+CHECK_ENABLED = True       # False пропускает проверку, тогда в подписку идут все серверы без пометок
+CHECK_YOUTUBE = True       # проверять, открывается ли YouTube
+CHECK_CANDIDATES = 3500    # сколько серверов проверять за один запуск
+CHECK_LTE_CANDIDATES = 1200  # из них не больше стольких из LTE списков
+CHECK_BATCH = 200          # серверов в одном запуске Xray
+CHECK_THREADS = 100        # сколько проверок одновременно
+CHECK_TIMEOUT = 8          # секунд на один запрос
+CHECK_TIME_BUDGET = 1500   # секунд на всю проверку, дальше непроверенные серверы отбрасываются
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+BASE_PORT = 21000
+
+# Как телефон следит за серверами внутри записи.
+# Чем чаще проверка, тем быстрее уход с упавшего сервера, но тем больше трафика и батареи.
 PROBE_URL = "https://www.gstatic.com/generate_204"
+PROBE_INTERVAL = "30s"
+PROBE_TIMEOUT = "4s"
 
 # Маршрутизация внутри подписки (профиль "RU + Roblox direct, rest VPN").
 # Что в списках, идет напрямую, все остальное через VPN.
@@ -89,7 +116,6 @@ DIRECT_IPS = [
     "128.116.0.0/17", "103.140.28.0/23",
     "2620:135:6000::/40", "2620:2b:e000::/48",
 ]
-PROBE_INTERVAL = "2m"
 
 RU_NAMES = {
     "RU": "Россия", "US": "США", "DE": "Германия", "FR": "Франция",
@@ -593,6 +619,7 @@ def flag_of(code):
     return "".join(chr(0x1F1E6 + ord(ch) - 65) for ch in code)
 
 
+
 def routing_block():
     if ROUTING_ENABLED:
         rules = [
@@ -622,7 +649,7 @@ def make_config(remark, items):
     outbounds.append({"tag": "block", "protocol": "blackhole"})
     return {
         "remarks": remark,
-        "meta": {"serverDescription": "Серверов: %d, выбор по минимальной задержке" % len(items)},
+        "meta": {"serverDescription": "Серверов: %d" % len(items)},
         "log": {"loglevel": "warning"},
         "inbounds": [
             {"tag": "socks", "listen": "127.0.0.1", "port": 10808, "protocol": "socks",
@@ -636,13 +663,168 @@ def make_config(remark, items):
         "burstObservatory": {
             "subjectSelector": ["p-"],
             "pingConfig": {"destination": PROBE_URL, "connectivity": "",
-                           "interval": PROBE_INTERVAL, "sampling": 2, "timeout": "6s"},
+                           "interval": PROBE_INTERVAL, "sampling": 1, "timeout": PROBE_TIMEOUT},
         },
     }
 
 
-def suffix(label):
-    return " (%s)" % label if label else ""
+# ---------- проверка серверов настоящим Xray ----------
+
+def prepare_xray():
+    try:
+        req = urllib.request.Request(XRAY_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+        workdir = tempfile.mkdtemp()
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            archive.extract("xray", workdir)
+        path = os.path.join(workdir, "xray")
+        os.chmod(path, 0o755)
+        version = subprocess.run([path, "version"], capture_output=True, text=True, timeout=20).stdout
+        print("Xray для проверки: " + (version.splitlines() or ["?"])[0])
+        return path, workdir
+    except Exception as exc:
+        print("Xray подготовить не удалось: %s" % exc)
+        return None, None
+
+
+def batch_config(items):
+    inbounds, outbounds, rules = [], [], []
+    for i, item in enumerate(items):
+        ob = json.loads(json.dumps(item["ob"]))
+        ob["tag"] = "out%d" % i
+        outbounds.append(ob)
+        inbounds.append({"tag": "in%d" % i, "listen": "127.0.0.1", "port": BASE_PORT + i,
+                         "protocol": "socks", "settings": {"auth": "noauth", "udp": False}})
+        rules.append({"type": "field", "inboundTag": ["in%d" % i], "outboundTag": "out%d" % i})
+    outbounds.append({"tag": "direct", "protocol": "freedom"})
+    return {"log": {"loglevel": "none"}, "inbounds": inbounds, "outbounds": outbounds,
+            "routing": {"domainStrategy": "AsIs", "rules": rules}}
+
+
+def xray_valid(xray, workdir, items):
+    path = os.path.join(workdir, "test.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(batch_config(items), fh)
+    try:
+        result = subprocess.run([xray, "run", "-test", "-c", path],
+                                capture_output=True, text=True, timeout=60)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def filter_valid(xray, workdir, items):
+    # Если в пачке есть сервер, который Xray не принимает, пачка делится пополам, пока он не найдется.
+    if not items:
+        return []
+    if xray_valid(xray, workdir, items):
+        return items
+    if len(items) == 1:
+        return []
+    mid = len(items) // 2
+    return filter_valid(xray, workdir, items[:mid]) + filter_valid(xray, workdir, items[mid:])
+
+
+def curl(port, url, timeout):
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "-m", str(timeout),
+             "--socks5-hostname", "127.0.0.1:%d" % port,
+             "-w", "%{http_code} %{time_total}", url],
+            capture_output=True, text=True, timeout=timeout + 5)
+        code, _, spent = result.stdout.strip().partition(" ")
+        return code, float(spent or 0)
+    except Exception:
+        return "000", 0.0
+
+
+def check_one(port):
+    code, spent = curl(port, PROBE_URL, CHECK_TIMEOUT)
+    if code != "204":
+        return {"alive": False, "yt": False, "ms": 0}
+    yt = True
+    if CHECK_YOUTUBE:
+        code, _ = curl(port, "https://www.youtube.com/robots.txt", CHECK_TIMEOUT + 4)
+        yt = code == "200"
+    return {"alive": True, "yt": yt, "ms": int(spent * 1000)}
+
+
+def wait_port(port, proc):
+    for _ in range(40):
+        if proc.poll() is not None:
+            return False
+        try:
+            socket.create_connection(("127.0.0.1", port), 0.5).close()
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def run_batch(xray, workdir, items):
+    path = os.path.join(workdir, "run.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(batch_config(items), fh)
+    proc = subprocess.Popen([xray, "run", "-c", path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if not wait_port(BASE_PORT + len(items) - 1, proc):
+            return False
+        with concurrent.futures.ThreadPoolExecutor(CHECK_THREADS) as pool:
+            futures = {pool.submit(check_one, BASE_PORT + i): i for i in range(len(items))}
+            for future in concurrent.futures.as_completed(futures):
+                items[futures[future]].update(future.result())
+        return True
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(10)
+        except Exception:
+            proc.kill()
+
+
+def check_all(items):
+    # Возвращает True, если проверка выполнена и нашлись рабочие серверы.
+    for item in items:
+        item.update({"alive": False, "yt": False, "ms": 0})
+    if not CHECK_ENABLED:
+        print("проверка серверов отключена")
+        return False
+    xray, workdir = prepare_xray()
+    if not xray:
+        return False
+    started = time.time()
+    hy2 = [i for i in items if i["kind"] == "hy2"]
+    queue = [i for i in items if i["kind"] == "std"]
+    if hy2:
+        if any(xray_valid(xray, workdir, [i]) for i in hy2[:5]):
+            queue += hy2
+        else:
+            print("Hysteria2 эта версия Xray не принимает, такие серверы убраны")
+    invalid = 0
+    skipped = 0
+    for start in range(0, len(queue), CHECK_BATCH):
+        chunk = queue[start:start + CHECK_BATCH]
+        if time.time() - started > CHECK_TIME_BUDGET:
+            skipped += len(queue) - start
+            break
+        good = filter_valid(xray, workdir, chunk)
+        invalid += len(chunk) - len(good)
+        if good and not run_batch(xray, workdir, good):
+            print("Xray не запустился на пачке из %d серверов" % len(good))
+            for item in good:
+                item["alive"] = False
+    alive = [i for i in items if i["alive"]]
+    print("проверено серверов: %d, Xray не принял: %d, не успели проверить: %d, рабочих: %d, из них с YouTube: %d" % (
+        len(queue) - skipped, invalid, skipped, len(alive), sum(1 for i in alive if i["yt"])))
+    return bool(alive)
+
+
+# ---------- сборка записей ----------
+
+def order_key(item):
+    return (0 if item.get("yt", True) else 1, item.get("ms", 0))
 
 
 def by_country_map(items):
@@ -652,209 +834,121 @@ def by_country_map(items):
     return result
 
 
-def size_of(label):
-    return COUNTRY_PACK if not label else EXTRA_PACK
+def diverse(items, count):
+    # По кругу берет серверы из разных стран и разных хостов.
+    if len(items) <= count:
+        return list(items)
+    queues = sorted((pick(v, len(v)) for v in by_country_map(items).values()), key=len, reverse=True)
+    out = []
+    while len(out) < count and any(queues):
+        for queue in queues:
+            if queue and len(out) < count:
+                out.append(queue.pop(0))
+    return out
 
 
-def packs_count(items, size):
-    return -(-len(items) // size)
+def top_diverse(items, count):
+    groups = by_country_map(sorted(items, key=order_key))
+    queues = sorted(groups.values(), key=lambda g: order_key(g[0]))
+    out = []
+    while len(out) < count and any(queues):
+        for queue in queues:
+            if queue and len(out) < count:
+                out.append(queue.pop(0))
+    return sorted(out, key=order_key)
 
 
-def take_packs(items, size, count):
-    result = []
-    left = items
-    for _ in range(count):
-        chosen = pick(left, size)
-        if not chosen:
-            break
-        left = without(left, chosen)
-        result.append(chosen)
-    return result
+def make_packs(items, size):
+    ok = sorted([i for i in items if i.get("yt", True)], key=order_key)
+    bad = sorted([i for i in items if not i.get("yt", True)], key=order_key)
+    packs = [(ok[i:i + size], True) for i in range(0, len(ok), size)]
+    packs += [(bad[i:i + size], False) for i in range(0, len(bad), size)]
+    return packs
 
 
-def allocate(quota, counts):
-    # Сначала по одной записи каждому ключу по порядку, потом по кругу добавляются еще.
-    got = {key: 0 for key, _ in counts}
-    for key, avail in counts:
-        if quota <= 0:
-            break
-        if avail > 0:
-            got[key] = 1
-            quota -= 1
-    moved = True
-    while quota > 0 and moved:
-        moved = False
-        for key, avail in counts:
-            if quota > 0 and got[key] < avail:
-                got[key] += 1
-                quota -= 1
-                moved = True
-    return got
+def pack_name(prefix, num, yt, letter="N"):
+    return "%s %s%d%s" % (prefix, letter, num, "" if yt else " YT:❌")
 
 
-def min_quota(info, size, need):
-    # Наименьшее число записей, в которых вместе не меньше need серверов (или все серверы источника).
-    keys = [(key, avail) for key, avail, _ in info]
-    total = sum(m for _, _, m in info)
-    need = min(need, total)
-    for quota in range(1, sum(a for _, a in keys) + 1):
-        got = allocate(quota, keys)
-        if sum(min(m, got[key] * size) for key, _, m in info) >= need:
-            return quota
-    return sum(a for _, a in keys)
-
-
-def distribute(budget, labels, avail, mins):
-    quota = {l: mins[l] for l in labels}
-    if sum(quota.values()) > budget:
-        quota = {l: 0 for l in labels}
-        left = budget
-        moved = True
-        while left > 0 and moved:
-            moved = False
-            for l in labels:
-                if left > 0 and quota[l] < mins[l]:
-                    quota[l] += 1
-                    left -= 1
-                    moved = True
-        return quota
-    left = budget - sum(quota.values())
-    main = labels[0]
-    extra = min(avail[main] - quota[main], left)
-    quota[main] += extra
-    left -= extra
-    moved = True
-    while left > 0 and moved:
-        moved = False
-        for l in labels[1:]:
-            if left > 0 and quota[l] < avail[l]:
-                quota[l] += 1
-                left -= 1
-                moved = True
-    return quota
-
-
-def mixed(black, white, count):
-    half = count // 2
-    return pick(black, half if white else count) + pick(white, half if black else count)
+def select_candidates(items):
+    lte = [i for i in items if i["lte"]]
+    small = [i for i in items if not i["lte"] and not i["big"]]
+    big = [i for i in items if not i["lte"] and i["big"]]
+    lte = diverse(lte, CHECK_LTE_CANDIDATES)
+    room = max(CHECK_CANDIDATES - len(lte) - len(small), 0)
+    return lte + small + diverse(big, room)
 
 
 def build(items):
-    labels = list(dict.fromkeys(i["label"] for i in items))
-    lists = []
-    for label in labels:
-        std = [i for i in items if i["label"] == label and i["kind"] == "std"]
-        lists.append((label,
-                      [i for i in std if i["src"] == "black"],
-                      [i for i in std if i["src"] == "white"]))
-    groups = []
-    if ALL_MODE == "all":
-        mix = []
-        for label, black, white in lists:
-            mix += pick(black, ALL_PART) + pick(white, ALL_PART)
-        if mix:
-            groups.append(make_config("🌐 Автовыбор все", mix))
-    elif ALL_MODE == "sources":
-        for label, black, white in lists:
-            chosen = mixed(black, white, SOURCE_ALL_PART)
-            if chosen:
-                groups.append(make_config("🌐 Автовыбор " + (label or "igareck"), chosen))
-    if BL_WL_GROUPS:
-        for label, black, white in lists:
-            if black:
-                groups.append(make_config("⚫ Автовыбор Blacklist" + suffix(label), pick(black, LIST_PACK)))
-            if white:
-                groups.append(make_config("⚪ Автовыбор Whitelist" + suffix(label), pick(white, LIST_PACK)))
+    std = [i for i in items if i["kind"] == "std"]
+    hy2 = [i for i in items if i["kind"] == "hy2"]
+    ok_std = [i for i in std if i.get("yt", True)] or std
 
-    plan = {}
-    avail = {}
-    info = {}
-    for label in labels:
-        size = size_of(label)
-        entries = []
-        for kind in ("std", "hy2"):
-            pool = [i for i in items if i["label"] == label and i["kind"] == kind]
-            part = by_country_map(pool)
-            nameless = part.pop("", [])
-            for code in sorted(part, key=lambda c: -len(part[c])):
-                if label and len(part[code]) < EXTRA_MIN_COUNTRY:
-                    continue
-                entries.append(((kind, code), part[code]))
-            if nameless:
-                entries.append(((kind, ""), nameless))
-        plan[label] = entries
-        info[label] = [(key, packs_count(v, size), len(v)) for key, v in entries]
-        avail[label] = sum(a for _, a, _ in info[label])
-    mins = {l: min_quota(info[l], size_of(l), MIN_SERVERS_PER_SOURCE) for l in labels}
-    quota = distribute(max(MAX_ENTRIES - len(groups), 0), labels, avail, mins)
+    head = []
+    if ok_std:
+        head.append(make_config("🌐 Все", top_diverse(ok_std, GROUP_PACK)))
+    black = [i for i in ok_std if "black" in i["srcs"]]
+    white = [i for i in ok_std if "white" in i["srcs"]]
+    if black:
+        head.append(make_config("⚫ Blacklist", top_diverse(black, GROUP_PACK)))
+    if white:
+        head.append(make_config("⚪ Whitelist", top_diverse(white, GROUP_PACK)))
+
+    lte_pool = sorted([i for i in std if i["lte"]], key=order_key)[:LTE_MAX]
+    lte_cfgs = []
+    for num, (chunk, yt) in enumerate(make_packs(lte_pool, PACK), 1):
+        lte_cfgs.append(make_config(pack_name("📶 LTE", num, yt), chunk))
+
+    budget = max(MAX_ENTRIES - len(head) - len(lte_cfgs), 0)
+    plist = {}
+    for kind_items, letter in ((std, "N"), (hy2, "H")):
+        for code, part in by_country_map(kind_items).items():
+            for num, (chunk, yt) in enumerate(make_packs(part, PACK), 1):
+                plist.setdefault(code, []).append((chunk, yt, num, letter))
+    totals = {code: sum(len(c) for c, _, _, _ in lst) for code, lst in plist.items()}
+    codes = [c for c in sorted(totals, key=lambda c: (c == "", -totals[c])) if totals[c] >= MIN_COUNTRY_SERVERS]
+
+    chosen = []
+    rnd = 0
+    while len(chosen) < budget:
+        moved = False
+        for code in codes:
+            if rnd < len(plist[code]) and len(chosen) < budget:
+                chosen.append((code, rnd, plist[code][rnd]))
+                moved = True
+        if not moved:
+            break
+        rnd += 1
 
     rows = []
-    nameless_rows = []
-    cut = {}
-    for li, label in enumerate(labels):
-        size = size_of(label)
-        counts = [(key, packs_count(v, size)) for key, v in plan[label]]
-        got = allocate(quota[label], counts)
-        for key, value in plan[label]:
-            kind, code = key
-            n = got[key]
-            if n == 0:
-                cut.setdefault(label, []).append(code or "без страны")
-                continue
-            name = RU_NAMES.get(code, code) if code else "Без страны"
-            flag = flag_of(code) if code else "🌐"
-            what = "(автовыбор %d)" if kind == "std" else "(Hy2 автовыбор %d)"
-            order = 0 if kind == "std" else 1
-            for num, chosen in enumerate(take_packs(value, size, n), 1):
-                cfg = make_config("%s %s %s%s" % (flag, name, what % num, suffix(label)), chosen)
-                if code:
-                    rows.append((name, li, order, num, cfg))
-                else:
-                    nameless_rows.append((li, order, num, cfg))
-    rows.sort(key=lambda row: row[:4])
-    nameless_rows.sort(key=lambda row: row[:3])
-    configs = groups + [row[4] for row in rows] + [row[3] for row in nameless_rows]
-    for label in labels:
-        size = size_of(label)
-        got = allocate(quota[label], [(k, a) for k, a, _ in info[label]])
-        shown = sum(min(m, got[k] * size) for k, _, m in info[label])
-        print("[%s] записей %d из %d возможных, серверов в них %d" % (label or "igareck", quota[label], avail[label], shown))
-        if cut.get(label):
-            print("  не вошли из-за лимита %d: %s" % (MAX_ENTRIES, ", ".join(dict.fromkeys(cut[label]))))
+    for code, rnd, (chunk, yt, num, letter) in chosen:
+        name = RU_NAMES.get(code, code) if code else "\uffff"
+        prefix = flag_of(code) if code else "🌐"
+        rows.append((name, rnd, make_config(pack_name(prefix, num, yt, letter), chunk)))
+    rows.sort(key=lambda row: row[:2])
+    configs = head + lte_cfgs + [row[2] for row in rows]
+    print("записей: групп %d, LTE %d (серверов %d), стран и прочих %d" % (
+        len(head), len(lte_cfgs), len(lte_pool), len(rows)))
+    if len(lte_pool) < LTE_TARGET:
+        print("LTE серверов меньше желаемых %d, рабочих найдено %d" % (LTE_TARGET, len(lte_pool)))
     return configs
 
 
 def report(items):
-    print("принято серверов: %d" % len(items))
-    for label in dict.fromkeys(i["label"] for i in items):
-        part = [i for i in items if i["label"] == label]
-        by_c = Counter(i["country"] for i in part if i["country"])
-        kinds = Counter(i["ob"]["protocol"] for i in part)
-        print("[%s] серверов %d (%s), стран %d, без страны %d" % (
-            label or "igareck", len(part), ", ".join("%s %d" % kv for kv in kinds.most_common()),
-            len(by_c), sum(1 for i in part if not i["country"])))
-        if not label:
-            print("  по странам: " + ", ".join("%s %d" % (RU_NAMES.get(c, c), n) for c, n in by_c.most_common()))
+    print("серверов в расчете: %d" % len(items))
+    kinds = Counter(i["ob"]["protocol"] for i in items)
+    print("протоколы: " + ", ".join("%s %d" % kv for kv in kinds.most_common()))
+    by_c = Counter(i["country"] for i in items if i["country"])
+    print("стран: %d, без страны: %d" % (len(by_c), sum(1 for i in items if not i["country"])))
+    print("по странам: " + ", ".join("%s %d" % (RU_NAMES.get(c, c), n) for c, n in by_c.most_common()))
     if SKIPPED:
-        print("пропущено: " + ", ".join("%s %d" % (k, v) for k, v in SKIPPED.most_common()))
-    have = {i["country"] for i in items if i["country"]}
-    lost = [c for c in LOST if c and c not in have]
-    if lost:
-        print("страны только среди пропущенных: " + ", ".join("%s %d" % (c, LOST[c]) for c in lost))
-    heads = []
-    for item in items:
-        if not item["country"] and not item["label"]:
-            head = item["remark"][:30]
-            if head not in heads:
-                heads.append(head)
-    if heads:
-        print("серверы без страны (igareck), примеры названий: " + " | ".join(heads[:8]))
+        print("пропущено при разборе: " + ", ".join("%s %d" % (k, v) for k, v in SKIPPED.most_common()))
 
 
 def main():
     items = []
-    seen = set()
-    for src, label, bases, name in SOURCES:
+    by_key = {}
+    for src, lte, bases, name in SOURCES:
         try:
             links, base = fetch_list(bases, name)
         except RuntimeError as exc:
@@ -863,16 +957,31 @@ def main():
         added = 0
         for link in links:
             item = convert(link)
-            if not item or item["key"] in seen:
+            if not item:
                 continue
-            seen.add(item["key"])
-            item["src"] = src
-            item["label"] = label
+            old = by_key.get(item["key"])
+            if old:
+                old["lte"] = old["lte"] or lte
+                old["srcs"].add(src)
+                continue
+            item["srcs"] = {src}
+            item["lte"] = lte
+            item["big"] = bases is GOIDA
+            by_key[item["key"]] = item
             items.append(item)
             added += 1
-        print("%s [%s]: ссылок %d, принято %d (%s)" % (name, label or "igareck", len(links), added, base.split("/")[2]))
+        print("%s: ссылок %d, новых %d (%s)" % (name, len(links), added, base.split("/")[2]))
     if not items:
         raise RuntimeError("ни один список не скачался")
+    candidates = select_candidates(items)
+    print("к проверке отобрано серверов: %d из %d" % (len(candidates), len(items)))
+    if check_all(candidates):
+        items = [i for i in candidates if i["alive"]]
+    else:
+        print("проверка не выполнена, в подписку идут серверы без проверки")
+        for item in candidates:
+            item["yt"] = True
+        items = candidates
     configs = build(items)
     report(items)
     with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
