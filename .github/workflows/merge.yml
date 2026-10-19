@@ -11,16 +11,19 @@ permissions:
 jobs:
   merge:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: build
-        run: |
-          python3 build_json_Ver.01.py
+      - name: build old
+        run: python3 build_json_old_Ver.01.py
+      - name: build new
+        run: python3 build_json_Ver.01.py
       - name: commit
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add auto_subs.json
+          git add -A
           if git diff --cached --quiet; then
             exit 0
           fi
