@@ -383,6 +383,16 @@ def stream(q, address, default_sec="none"):
     return ss
 
 
+def plain_to_public_ip(ss, address):
+    # Новые версии Xray не принимают VLESS и Trojan без шифрования, если адрес сервера это публичный IP.
+    if ss["security"] != "none":
+        return False
+    try:
+        return not ipaddress.ip_address(address).is_private
+    except ValueError:
+        return False
+
+
 def conv_vless(parts):
     _, user, host, port, q, frag = parts
     ss = stream(q, host)
@@ -391,6 +401,8 @@ def conv_vless(parts):
     enc = q.get("encryption") or "none"
     if enc != "none" and not enc.startswith("mlkem768x25519plus"):
         enc = "none"
+    if enc == "none" and plain_to_public_ip(ss, host):
+        return None
     account = {"id": user, "encryption": enc}
     flow = q.get("flow", "")
     if flow and ss["network"] == "tcp" and ss["security"] in ("tls", "reality"):
@@ -407,6 +419,8 @@ def conv_trojan(parts):
     _, user, host, port, q, frag = parts
     ss = stream(q, host, default_sec="tls")
     if ss is None or not user:
+        return None
+    if plain_to_public_ip(ss, host):
         return None
     ob = {
         "protocol": "trojan",
@@ -787,13 +801,13 @@ def run_batch(xray, workdir, items):
 def check_all(items):
     # Возвращает True, если проверка выполнена и нашлись рабочие серверы.
     for item in items:
-        item.update({"alive": False, "yt": False, "ms": 0})
+        item.update({"alive": False, "yt": False, "ms": 0, "valid": False})
     if not CHECK_ENABLED:
         print("проверка серверов отключена")
-        return False
+        return "none"
     xray, workdir = prepare_xray()
     if not xray:
-        return False
+        return "none"
     started = time.time()
     hy2 = [i for i in items if i["kind"] == "hy2"]
     queue = [i for i in items if i["kind"] == "std"]
@@ -811,6 +825,8 @@ def check_all(items):
             break
         good = filter_valid(xray, workdir, chunk)
         invalid += len(chunk) - len(good)
+        for item in good:
+            item["valid"] = True
         if good and not run_batch(xray, workdir, good):
             print("Xray не запустился на пачке из %d серверов" % len(good))
             for item in good:
@@ -818,7 +834,7 @@ def check_all(items):
     alive = [i for i in items if i["alive"]]
     print("проверено серверов: %d, Xray не принял: %d, не успели проверить: %d, рабочих: %d, из них с YouTube: %d" % (
         len(queue) - skipped, invalid, skipped, len(alive), sum(1 for i in alive if i["yt"])))
-    return bool(alive)
+    return "probed" if alive else "validated"
 
 
 # ---------- сборка записей ----------
@@ -975,13 +991,19 @@ def main():
         raise RuntimeError("ни один список не скачался")
     candidates = select_candidates(items)
     print("к проверке отобрано серверов: %d из %d" % (len(candidates), len(items)))
-    if check_all(candidates):
+    mode = check_all(candidates)
+    if mode == "probed":
         items = [i for i in candidates if i["alive"]]
     else:
-        print("проверка не выполнена, в подписку идут серверы без проверки")
         for item in candidates:
             item["yt"] = True
-        items = candidates
+        valid = [i for i in candidates if i["valid"]]
+        if mode == "validated" and valid:
+            print("проверка по сети не удалась, взяты только серверы, принятые Xray: %d" % len(valid))
+            items = valid
+        else:
+            print("проверка не выполнена, в подписку идут серверы без проверки")
+            items = candidates
     configs = build(items)
     report(items)
     with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
