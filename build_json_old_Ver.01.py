@@ -84,9 +84,13 @@ PROBE_URL = "https://www.gstatic.com/generate_204"
 # Маршрутизация внутри подписки (профиль "RU + Roblox direct, rest VPN").
 # Что в списках, идет напрямую, все остальное через VPN.
 ROUTING_ENABLED = True
+# Картинки, иконки и текстуры Roblox грузятся с rbxcdn.com (в России основной домен tr.rbxcdn.com
+# не открывается напрямую). Эти домены идут через VPN, раньше прямых правил.
+# Игровой трафик (UDP на серверы Roblox) остается прямым, поэтому пинг не меняется.
+PROXY_DOMAINS = ["domain:rbxcdn.com"]
 DIRECT_DOMAINS = [
     "domain:ru", "domain:su", "domain:xn--p1ai",
-    "domain:roblox.com", "domain:rbxcdn.com", "domain:roblox.qq.com",
+    "domain:roblox.com", "domain:roblox.qq.com",
     "domain:robloxlabs.com", "domain:rbxtrk.com",
 ]
 DIRECT_IPS = [
@@ -615,6 +619,7 @@ def flag_of(code):
 def routing_block():
     if ROUTING_ENABLED:
         rules = [
+            {"type": "field", "domain": PROXY_DOMAINS, "balancerTag": "auto"},
             {"type": "field", "domain": DIRECT_DOMAINS, "outboundTag": "direct"},
             {"type": "field", "ip": DIRECT_IPS, "outboundTag": "direct"},
         ]
