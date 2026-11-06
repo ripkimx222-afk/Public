@@ -4,11 +4,16 @@
 # Happ сам выбирает сервер с наименьшей задержкой внутри записи.
 
 import base64
+import io
 import ipaddress
 import json
+import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -357,6 +362,16 @@ def stream(q, address, default_sec="none"):
     return ss
 
 
+def plain_to_public_ip(ss, address):
+    # Новые версии Xray не принимают VLESS и Trojan без шифрования, если адрес сервера это публичный IP.
+    if ss["security"] != "none":
+        return False
+    try:
+        return not ipaddress.ip_address(address).is_private
+    except ValueError:
+        return False
+
+
 def conv_vless(parts):
     _, user, host, port, q, frag = parts
     ss = stream(q, host)
@@ -365,6 +380,8 @@ def conv_vless(parts):
     enc = q.get("encryption") or "none"
     if enc != "none" and not enc.startswith("mlkem768x25519plus"):
         enc = "none"
+    if enc == "none" and plain_to_public_ip(ss, host):
+        return None
     account = {"id": user, "encryption": enc}
     flow = q.get("flow", "")
     if flow and ss["network"] == "tcp" and ss["security"] in ("tls", "reality"):
@@ -381,6 +398,8 @@ def conv_trojan(parts):
     _, user, host, port, q, frag = parts
     ss = stream(q, host, default_sec="tls")
     if ss is None or not user:
+        return None
+    if plain_to_public_ip(ss, host):
         return None
     ob = {
         "protocol": "trojan",
@@ -851,6 +870,77 @@ def report(items):
         print("серверы без страны (igareck), примеры названий: " + " | ".join(heads[:8]))
 
 
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+VALID_BATCH = 200
+
+
+def prepare_xray():
+    try:
+        req = urllib.request.Request(XRAY_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+        workdir = tempfile.mkdtemp()
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            archive.extract("xray", workdir)
+        path = os.path.join(workdir, "xray")
+        os.chmod(path, 0o755)
+        version = subprocess.run([path, "version"], capture_output=True, text=True, timeout=20).stdout
+        print("Xray для проверки конфигов: " + (version.splitlines() or ["?"])[0])
+        return path, workdir
+    except Exception as exc:
+        print("Xray подготовить не удалось: %s" % exc)
+        return None, None
+
+
+def xray_valid(xray, workdir, items):
+    inbounds, outbounds = [], []
+    for i, item in enumerate(items):
+        ob = json.loads(json.dumps(item["ob"]))
+        ob["tag"] = "out%d" % i
+        outbounds.append(ob)
+    outbounds.append({"tag": "direct", "protocol": "freedom"})
+    path = os.path.join(workdir, "test.json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"log": {"loglevel": "none"}, "outbounds": outbounds}, fh)
+    try:
+        result = subprocess.run([xray, "run", "-test", "-c", path],
+                                capture_output=True, text=True, timeout=60)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def filter_valid(xray, workdir, items):
+    # Если Xray не принимает какой-то сервер, пачка делится пополам, пока он не найдется.
+    if not items:
+        return []
+    if xray_valid(xray, workdir, items):
+        return items
+    if len(items) == 1:
+        return []
+    mid = len(items) // 2
+    return filter_valid(xray, workdir, items[:mid]) + filter_valid(xray, workdir, items[mid:])
+
+
+def validate_items(items):
+    xray, workdir = prepare_xray()
+    if not xray:
+        print("проверка конфигов Xray пропущена")
+        return items
+    hy2 = [i for i in items if i["kind"] == "hy2"]
+    queue = [i for i in items if i["kind"] == "std"]
+    if hy2:
+        if any(xray_valid(xray, workdir, [i]) for i in hy2[:5]):
+            queue += hy2
+        else:
+            print("Hysteria2 эта версия Xray не принимает, такие серверы убраны")
+    good = []
+    for start in range(0, len(queue), VALID_BATCH):
+        good += filter_valid(xray, workdir, queue[start:start + VALID_BATCH])
+    print("Xray отбросил %d серверов, которые он не принимает" % (len(queue) - len(good)))
+    return good or items
+
+
 def main():
     items = []
     seen = set()
@@ -873,6 +963,7 @@ def main():
         print("%s [%s]: ссылок %d, принято %d (%s)" % (name, label or "igareck", len(links), added, base.split("/")[2]))
     if not items:
         raise RuntimeError("ни один список не скачался")
+    items = validate_items(items)
     configs = build(items)
     report(items)
     with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
